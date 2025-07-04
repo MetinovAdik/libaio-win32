@@ -76,3 +76,8 @@ cl.exe my_app.cpp /I"C:\path\to\libaio-win32" /link /LIBPATH:"C:\path\to\libaio-
 ## License
 
 This project is licensed under the **MIT License**. See the `LICENSE` file for details.
+## About the Author
+
+This library was developed by **Metinov Adilet**.
+
+You can find more of my work on my [GitHub profile](https://github.com/MetinovAdik). Feel free to connect or check out my other projects.
