@@ -4,8 +4,8 @@
  *
  * This translation layer maps libaio's context and submission model to the
  * functionally equivalent, high-performance IOCP system on Windows. It includes
- * a behaviorally-correct emulation of vectored I/O using an atomic aggregation layer
- * and emulation for filesystem synchronization commands.
+ * a behaviorally-correct emulation of vectored I/O using an atomic aggregation layer,
+ * emulation for filesystem synchronization commands, and robust error code mapping.
  */
 
 #include "libaio_win32.h"
@@ -85,6 +85,42 @@ static DWORD timespec_to_ms(const struct timespec* timeout) {
     return (DWORD)((timeout->tv_sec * 1000) + (timeout->tv_nsec / 1000000));
 }
 
+/**
+ * @brief Maps a Windows error code from GetLastError() to a POSIX errno value.
+ * @param win_error The Windows error code.
+ * @return The closest negative POSIX errno value.
+ */
+static int windows_error_to_errno(DWORD win_error) {
+    switch (win_error) {
+        // Direct POSIX equivalents
+    case ERROR_SUCCESS:             return 0;
+    case ERROR_ACCESS_DENIED:       return -EACCES;
+    case ERROR_FILE_NOT_FOUND:      return -ENOENT;
+    case ERROR_PATH_NOT_FOUND:      return -ENOENT;
+    case ERROR_INVALID_HANDLE:      return -EBADF;
+    case ERROR_NOT_ENOUGH_MEMORY:   return -ENOMEM;
+    case ERROR_OUTOFMEMORY:         return -ENOMEM;
+    case ERROR_INVALID_PARAMETER:   return -EINVAL;
+    case ERROR_INVALID_DRIVE:       return -ENODEV;
+    case ERROR_WRITE_PROTECT:       return -EROFS;
+    case ERROR_SHARING_VIOLATION:   return -EACCES;
+    case ERROR_LOCK_VIOLATION:      return -EACCES;
+    case ERROR_HANDLE_EOF:          return -EBADF;
+    case ERROR_IO_DEVICE:           return -EIO;
+    case ERROR_DISK_FULL:           return -ENOSPC;
+    case ERROR_FILE_EXISTS:         return -EEXIST;
+    case ERROR_ALREADY_EXISTS:      return -EEXIST;
+    case ERROR_OPERATION_ABORTED:   return -ECANCELED;
+    case WAIT_TIMEOUT:              return -ETIMEDOUT;
+
+        // Best-effort mappings
+    case ERROR_INVALID_FUNCTION:    return -EINVAL;
+    case ERROR_BAD_COMMAND:         return -EIO;
+
+    default:                        return -EIO; // Generic I/O error for unmapped codes
+    }
+}
+
 // --- API Function Implementations ---
 
 LIO_API int io_setup(int maxevents, io_context_t* ctxp) {
@@ -94,8 +130,9 @@ LIO_API int io_setup(int maxevents, io_context_t* ctxp) {
     }
     context->ioCompletionPort = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
     if (context->ioCompletionPort == NULL) {
+        DWORD last_error = GetLastError();
         delete context;
-        return -EAGAIN;
+        return windows_error_to_errno(last_error);
     }
     *ctxp = context;
     return 0;
@@ -117,19 +154,15 @@ LIO_API int io_submit(io_context_t ctx, long nr, struct iocb** iocbs) {
 
         // --- Filesystem Synchronization Path ---
         if (req->aio_lio_opcode == IO_CMD_FSYNC || req->aio_lio_opcode == IO_CMD_FDSYNC) {
-            // Step 1: Perform the synchronous flush. On Windows, FlushFileBuffers covers both data and metadata,
-            // making it a suitable equivalent for both FSYNC and FDSYNC.
             if (!FlushFileBuffers(fileHandle)) {
-                // To report this failure, we queue a no-op that will fail with the captured error.
-                // However, for simplicity here, we skip on immediate failure.
+                // To report this failure, we could queue a no-op that will fail with the captured error.
+                // For simplicity here, we skip on immediate failure.
                 continue;
             }
 
-            // Step 2: Queue a "no-op" async request to signal completion through the IOCP.
-            // A zero-byte read completes almost instantly but flows through the regular async path,
-            // allowing us to generate a proper and correctly-timed io_event.
+            // Queue a "no-op" async request to signal completion through the IOCP.
             WinAioRequest* win_req = new (std::nothrow) WinAioRequest();
-            if (!win_req) break; // Out of memory
+            if (!win_req) break;
             win_req->type = SINGLE_REQUEST;
             win_req->iocb_single = req;
             ZeroMemory(&win_req->overlapped, sizeof(OVERLAPPED));
@@ -137,7 +170,7 @@ LIO_API int io_submit(io_context_t ctx, long nr, struct iocb** iocbs) {
             DWORD dummy_bytes_read;
             if (!ReadFile(fileHandle, NULL, 0, &dummy_bytes_read, &win_req->overlapped)) {
                 if (GetLastError() != ERROR_IO_PENDING) {
-                    delete win_req; // Unexpected failure, clean up.
+                    delete win_req; // Unexpected failure.
                     continue;
                 }
             }
@@ -149,12 +182,12 @@ LIO_API int io_submit(io_context_t ctx, long nr, struct iocb** iocbs) {
         bool is_vectored = (req->aio_lio_opcode == IO_CMD_PREADV || req->aio_lio_opcode == IO_CMD_PWRITEV);
 
         if (is_vectored) {
-            if (req->u.v.nr_segs == 0) { // Handle zero-segment case as a success no-op.
+            if (req->u.v.nr_segs == 0) {
                 iocbs_processed++;
                 continue;
             }
             VectoredRequestGroup* group = new (std::nothrow) VectoredRequestGroup(req);
-            if (!group) break; // Critical memory failure.
+            if (!group) break;
 
             long long current_offset = req->u.v.offset;
             for (int seg = 0; seg < req->u.v.nr_segs; ++seg) {
@@ -173,7 +206,7 @@ LIO_API int io_submit(io_context_t ctx, long nr, struct iocb** iocbs) {
                     : WriteFile(fileHandle, iov->iov_base, (DWORD)iov->iov_len, NULL, &win_req->overlapped);
 
                 if (!result && GetLastError() != ERROR_IO_PENDING) {
-                    delete win_req; // Segment failed immediately.
+                    delete win_req;
                 }
                 current_offset += iov->iov_len;
             }
@@ -220,44 +253,55 @@ LIO_API int io_getevents(io_context_t ctx, long min_nr, long nr, struct io_event
         BOOL status = GetQueuedCompletionStatus(context->ioCompletionPort, &bytesTransferred, &completionKey, &overlapped_ptr, current_timeout);
 
         if (!overlapped_ptr) {
-            break; // Timeout or serious error, no packet dequeued.
+            // GetQueuedCompletionStatus itself failed without dequeuing a packet.
+            DWORD last_error = GetLastError();
+            // Timeout is an expected way to stop waiting, not an error.
+            if (last_error != WAIT_TIMEOUT) {
+                return windows_error_to_errno(last_error);
+            }
+            break; // Break loop on timeout.
         }
 
         WinAioRequest* win_req = CONTAINING_RECORD(overlapped_ptr, WinAioRequest, overlapped);
         bool is_group_complete = false;
+
+        DWORD io_error = 0;
+        if (!status) {
+            io_error = GetLastError();
+        }
 
         if (win_req->type == SINGLE_REQUEST) {
             struct io_event* current_event = &events[events_collected];
             current_event->data = win_req->iocb_single->data;
             current_event->obj = win_req->iocb_single;
             current_event->res = status ? bytesTransferred : 0;
-            current_event->res2 = status ? 0 : GetLastError();
+            current_event->res2 = io_error; // res2 stores the positive Windows error code.
             events_collected++;
         }
         else { // VECTORED_SEGMENT
             VectoredRequestGroup* group = win_req->group_vectored;
-            group->total_bytes_transferred.fetch_add(bytesTransferred);
-            if (!status) {
-                unsigned long err = GetLastError();
+            if (status) {
+                group->total_bytes_transferred.fetch_add(bytesTransferred);
+            }
+            else {
                 unsigned long expected = 0;
-                group->first_error.compare_exchange_strong(expected, err);
+                group->first_error.compare_exchange_strong(expected, io_error);
             }
 
-            // The atomic increment and check is the core of the aggregation logic.
             if (group->completed_segments.fetch_add(1) + 1 == group->total_segments) {
                 is_group_complete = true;
                 struct io_event* current_event = &events[events_collected];
                 current_event->data = group->original_iocb->data;
                 current_event->obj = group->original_iocb;
                 current_event->res = group->total_bytes_transferred.load();
-                current_event->res2 = group->first_error.load();
+                current_event->res2 = group->first_error.load(); // Store the positive error code.
                 events_collected++;
             }
         }
 
         delete win_req;
         if (is_group_complete) {
-            delete win_req->group_vectored; // The union member points to the group
+            delete win_req->group_vectored;
         }
 
         if (events_collected >= min_nr && current_timeout == 0) {
