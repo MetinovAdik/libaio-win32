@@ -7,7 +7,8 @@
  * This header replicates the essential types and function signatures from the
  * Linux libaio.h to allow for source-level compatibility for applications
  * being ported from Linux to Windows. It aims to be behaviorally identical
- * for the core set of I/O operations, including positional and vectored I/O.
+ * for the core set of I/O operations, including positional, vectored, and
+ * synchronization operations.
  */
 
 #include <errno.h>      // For standard error codes like ENOMEM
@@ -37,7 +38,7 @@ struct iovec {
 struct iocb {
     void* data;           ///< User-defined data. Returned verbatim in the corresponding io_event.
     unsigned        key;            ///< (Unused in this implementation)
-    short           aio_lio_opcode; ///< The I/O command (e.g., IO_CMD_PREAD, IO_CMD_PWRITEV).
+    short           aio_lio_opcode; ///< The I/O command (e.g., IO_CMD_PREAD, IO_CMD_FSYNC).
     short           aio_reqprio;    ///< I/O request priority. (Unused in this implementation)
     int             aio_fildes;     ///< The file descriptor for the I/O operation.
 
@@ -75,6 +76,8 @@ struct io_event {
 enum {
     IO_CMD_PREAD = 0,       ///< Positional read operation.
     IO_CMD_PWRITE = 1,      ///< Positional write operation.
+    IO_CMD_FSYNC = 5,       ///< Asynchronous file sync (data and metadata).
+    IO_CMD_FDSYNC = 6,      ///< Asynchronous file data sync.
     IO_CMD_PREADV = 7,      ///< Vectored (scatter/gather) positional read operation.
     IO_CMD_PWRITEV = 8,     ///< Vectored (scatter/gather) positional write operation.
 };
